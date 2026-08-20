@@ -145,8 +145,13 @@ def main():
             print(result.stderr)
     except subprocess.CalledProcessError as e:
         print("Error output:", e.stderr)
+        raise
 
     save_file = args.save_dir / args.task / f"{args.subset}.jsonl"
+    if not save_file.is_file():
+        raise FileNotFoundError(
+            f"RULER generator completed without creating {save_file}"
+        )
     print(f"Prepare {args.task} with lines: {args.num_samples} to {save_file}")
     print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
     

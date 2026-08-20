@@ -33,7 +33,7 @@ from pathlib import Path
 from tqdm import tqdm
 import random
 import numpy as np
-from nemo.collections.asr.parts.utils.manifest_utils import read_manifest, write_manifest
+from jsonl_utils import write_manifest
 import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")) 
 from tokenizer import select_tokenizer
