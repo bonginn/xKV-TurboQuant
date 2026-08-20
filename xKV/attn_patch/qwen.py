@@ -16,6 +16,24 @@ from transformers.models.qwen2.modeling_qwen2 import (
 from transformers.cache_utils import Cache
 from ..customized_cache.fake_layer_merge_dynamic_cache import FakeLayerMergingCache
 
+
+def _resolve_past_key_value(past_key_value, kwargs):
+    """Accept the singular and plural Qwen cache keyword across Transformers."""
+    past_key_values = kwargs.pop("past_key_values", None)
+    if (
+        past_key_value is not None
+        and past_key_values is not None
+        and past_key_value is not past_key_values
+    ):
+        raise ValueError(
+            "Received different caches through past_key_value and "
+            "past_key_values"
+        )
+    if past_key_value is not None:
+        return past_key_value
+    return past_key_values
+
+
 def xKV_qwen2_forward(
         self,
         hidden_states: torch.Tensor,
@@ -25,7 +43,8 @@ def xKV_qwen2_forward(
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        
+        past_key_value = _resolve_past_key_value(past_key_value, kwargs)
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 

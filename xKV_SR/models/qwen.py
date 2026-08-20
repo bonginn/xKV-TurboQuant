@@ -130,7 +130,10 @@ class Qwen2(LLM):
         self.num_key_value_heads = self.config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = self.config.max_position_embeddings
-        self.rope_theta = self.config.rope_theta
+        # RoPE frequencies are read from the loaded Hugging Face rotary
+        # embedding in init_parameters().  Do not require the legacy
+        # Qwen2Config.rope_theta attribute, which is absent in some
+        # Transformers versions.
 
         self.init_parameters()
         self.attn_mode = attn_mode
@@ -138,7 +141,8 @@ class Qwen2(LLM):
 
         self.merge_config = generate_consecutive_palu_config(
             start_layer=start_layer_idx,
-            end_layer=end_layer_idx if end_layer_idx != -1 else self.num_layers,
+            # generate_consecutive_palu_config uses an inclusive end index.
+            end_layer=end_layer_idx if end_layer_idx != -1 else self.num_layers - 1,
             group_size=group_size,
             rank_k=rank_k,
             rank_v=rank_v
@@ -150,11 +154,74 @@ class Qwen2(LLM):
         self.fake_svd = fake_svd
         self.init_kv_cache(sparse_budget, chunk_size, self.config, rank=rank, merge_config=self.merge_config)
 
-    def _set_cos_sin_cache(self, inv_freq: torch.Tensor):
-        t = torch.arange(self.max_length, device=self.device, dtype=torch.int64).type_as(inv_freq)
-        freqs = torch.outer(t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos().to(self.dtype), emb.sin().to(self.dtype)
+    def _set_cos_sin_cache(self, hf_model):
+        """Build a version-compatible cache through Hugging Face RoPE."""
+        # Transformers >= 4.46 stores one shared rotary embedding on the
+        # model. Older versions stored it on each attention layer.
+        rotary_emb = getattr(hf_model.model, "rotary_emb", None)
+        uses_model_level_api = rotary_emb is not None
+        if not uses_model_level_api:
+            first_attention = hf_model.model.layers[0].self_attn
+            rotary_emb = getattr(first_attention, "rotary_emb", None)
+
+        if rotary_emb is None:
+            raise RuntimeError(
+                "Unable to locate the Qwen2 rotary embedding on either "
+                "`model.rotary_emb` or "
+                "`model.layers[0].self_attn.rotary_emb`."
+            )
+
+        # Keep the module on its existing device. Some dynamic-RoPE versions
+        # retain a non-buffer alias of the original frequencies, so moving the
+        # module can leave its internal tensors split across devices.
+        inv_freq = getattr(rotary_emb, "inv_freq", None)
+        rotary_device = inv_freq.device if inv_freq is not None else torch.device("cpu")
+
+        # Calling Hugging Face's implementation preserves attention scaling,
+        # YaRN, and dynamic RoPE updates that a manual inv_freq path can miss.
+        with torch.inference_mode():
+            if uses_model_level_api:
+                dummy_x = torch.empty(
+                    (1, 1, self.hidden_size),
+                    device=rotary_device,
+                    dtype=self.dtype,
+                )
+                position_ids = torch.arange(
+                    self.max_length,
+                    device=rotary_device,
+                    dtype=torch.long,
+                ).unsqueeze(0)
+                cos_cache, sin_cache = rotary_emb(dummy_x, position_ids)
+            else:
+                dummy_x = torch.empty(
+                    (1, self.num_key_value_heads, 1, self.head_dim),
+                    device=rotary_device,
+                    dtype=self.dtype,
+                )
+                cos_cache, sin_cache = rotary_emb(
+                    dummy_x,
+                    seq_len=self.max_length,
+                )
+
+        # Newer model-level RoPE returns [1, length, head_dim], whereas the
+        # legacy attention-level implementation returns [length, head_dim].
+        if cos_cache.ndim == 3 and cos_cache.shape[0] == 1:
+            cos_cache = cos_cache[0]
+        if sin_cache.ndim == 3 and sin_cache.shape[0] == 1:
+            sin_cache = sin_cache[0]
+
+        expected_shape = (self.max_length, self.head_dim)
+        if tuple(cos_cache.shape) != expected_shape or tuple(sin_cache.shape) != expected_shape:
+            raise RuntimeError(
+                "Unexpected Qwen2 RoPE cache shapes: "
+                f"cos={tuple(cos_cache.shape)}, sin={tuple(sin_cache.shape)}, "
+                f"expected={expected_shape}."
+            )
+
+        return (
+            cos_cache.to(device=self.device, dtype=self.dtype).contiguous(),
+            sin_cache.to(device=self.device, dtype=self.dtype).contiguous(),
+        )
 
     def init_parameters(self):
         hf_model = Qwen2ForCausalLM.from_pretrained(self.model_name, torch_dtype=self.dtype)
@@ -162,7 +229,7 @@ class Qwen2(LLM):
         self.lm_head = hf_model.lm_head.weight.detach().to(self.device)
         self.norm_weight = hf_model.model.norm.weight.detach().to(self.device)
         self.norm_variance_epsilon = hf_model.model.norm.variance_epsilon
-        self.cos_cache, self.sin_cache = self._set_cos_sin_cache(hf_model.model.layers[0].self_attn.rotary_emb.inv_freq.to(self.device))
+        self.cos_cache, self.sin_cache = self._set_cos_sin_cache(hf_model)
         self.layers :list[Qwen2Layer] = []
 
         for idx, hf_layer in enumerate(hf_model.model.layers):

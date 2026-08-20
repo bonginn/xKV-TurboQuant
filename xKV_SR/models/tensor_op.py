@@ -21,11 +21,40 @@
 # See LICENSE.txt for license information
 ################################################################################
 
+import warnings
+
 import torch
 from torch.nn import functional as F
 
-from flashinfer.norm import rmsnorm
-from minference import vertical_slash_sparse_attention, block_sparse_attention, streaming_forward
+try:
+    from flashinfer.norm import rmsnorm as _flashinfer_rmsnorm
+except (ImportError, OSError):
+    _flashinfer_rmsnorm = None
+    warnings.warn(
+        "flashinfer is not installed; xKV-SR will use the PyTorch RMSNorm "
+        "fallback. This is suitable for accuracy evaluation but is slower.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+try:
+    from minference import (
+        block_sparse_attention,
+        streaming_forward,
+        vertical_slash_sparse_attention,
+    )
+    _minference_import_error = None
+except (ImportError, OSError) as exc:
+    block_sparse_attention = None
+    streaming_forward = None
+    vertical_slash_sparse_attention = None
+    _minference_import_error = exc
+    warnings.warn(
+        "MInference is not installed; `--minference_sr` is unavailable. "
+        "Standard xKV-SR accuracy evaluation remains available.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 from xKV_SR.kernels import shadowkv
 
@@ -34,19 +63,19 @@ def layer_norm(
     eps: float,
     w: torch.Tensor,
 ):
-    return rmsnorm(hidden_states.view(-1, hidden_states.size(-1)), w, eps).view_as(hidden_states)
+    if _flashinfer_rmsnorm is not None:
+        return _flashinfer_rmsnorm(
+            hidden_states.view(-1, hidden_states.size(-1)), w, eps
+        ).view_as(hidden_states)
 
-# def layer_norm(
-#     hidden_states: torch.Tensor,
-#     eps: float,
-#     w: torch.Tensor,
-# ):
-#     input_dtype = hidden_states.dtype
-#     hidden_states = hidden_states.to(torch.float32)
-#     variance = hidden_states.pow(2).mean(-1, keepdim=True)
-#     hidden_states = hidden_states * torch.rsqrt(variance + eps)
-#     hidden_states = w * hidden_states.to(input_dtype)
-#     return hidden_states
+    # Match transformers.models.qwen2.modeling_qwen2.Qwen2RMSNorm:
+    # accumulate the variance in FP32, then cast the normalized activations
+    # back to the input dtype before applying the learned weight.
+    input_dtype = hidden_states.dtype
+    hidden_states_fp32 = hidden_states.to(torch.float32)
+    variance = hidden_states_fp32.pow(2).mean(-1, keepdim=True)
+    normalized = hidden_states_fp32 * torch.rsqrt(variance + eps)
+    return w * normalized.to(input_dtype)
 
 
 # copy from https://github.com/microsoft/MInference/blob/main/minference/modules/minference_forward.py
@@ -64,6 +93,12 @@ def sum_all_diagonal_matrix(mat: torch.tensor):
     return sum_diags[:,:,1:]
 
 def minference_prefill_kernel(query_states, key_states, value_states, minference_parttern):
+    if _minference_import_error is not None:
+        raise RuntimeError(
+            "`--minference_sr` requires the optional MInference package, "
+            "but MInference could not be imported."
+        ) from _minference_import_error
+
     q_len = query_states.shape[2] # [bsz, heads, q_len, head_dim]
     bsz = query_states.shape[0]
     gqa_groups = query_states.shape[1] // key_states.shape[1]

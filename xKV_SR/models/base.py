@@ -180,6 +180,13 @@ class LLM:
                 with self._maybe_record_function("get_key_cache"):
                     key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single)
 
+                # Value reconstruction is queued on copy_stream above.  The
+                # attention kernel consumes the shared V buffer on the current
+                # stream, so establish the missing data dependency explicitly.
+                # Accuracy evaluation must never race a partially reconstructed
+                # value cache; performance overlap can be revisited separately.
+                curr_stream.wait_stream(get_value_stream)
+
                 # flash attention
                 with self._maybe_record_function("flash_attn_with_kvcache"):
                     hidden_states = flash_attn_with_kvcache(q=query_states.transpose(1, 2), k_cache=key_states.transpose(1, 2), v_cache=value_states.transpose(1, 2), causal=True)

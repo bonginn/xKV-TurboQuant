@@ -21,8 +21,13 @@ layer_to_group_map is stored as '_layer_map' so that each layer index can quickl
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
+import logging
 import yaml
-from loguru import logger
+
+try:
+    from loguru import logger
+except ImportError:  # Optional for offline accuracy evaluation.
+    logger = logging.getLogger(__name__)
 
 @dataclass
 class LayerGroup:
