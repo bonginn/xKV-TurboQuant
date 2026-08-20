@@ -20,9 +20,15 @@ layer_to_group_map is stored as '_layer_map' so that each layer index can quickl
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional, Dict
+import logging
 import yaml
-from loguru import logger
+
+try:
+    from loguru import logger
+except ImportError:  # Keep the offline evaluation environment lightweight.
+    logger = logging.getLogger(__name__)
 
 @dataclass
 class LayerGroup:
@@ -93,6 +99,15 @@ class xKVConfig:
     # Catch-all for future expansions
     extra_kwargs: dict = field(default_factory=dict)
 
+    # Extended quantizer configuration.  These fields are appended after all
+    # original init fields to preserve xKVConfig's legacy positional API.
+    kv_quantizer: str = "rtn"  # "rtn" or "turboquant_mse"
+    k_bits: Optional[int] = None  # Optional key override
+    v_bits: Optional[int] = None  # Optional value override
+    turboquant_rotation_seed: int = 42
+    turboquant_chunk_size: Optional[int] = 4096
+    turboquant_codebook_path: Optional[str] = None
+
     # We'll store the layer->group map here (built once in __post_init__)
     _layer_map: Dict[int, LayerGroup] = field(init=False, default_factory=dict)
 
@@ -103,6 +118,8 @@ class xKVConfig:
                 f"Invalid layer_merge_impl '{self.layer_merge_impl}'. "
                 "Must be 'svd' or 'slerp'."
             )
+
+        self._validate_quantization_config()
 
         # 1) Finalize each group's parameters
         if self.layer_merge_impl == "svd":
@@ -124,12 +141,118 @@ class xKVConfig:
                 grp.rank_k = None
                 grp.rank_v = None
 
+        if self.kv_quantizer == "turboquant_mse":
+            self._validate_turboquant_groups()
+
         # 2) Build layer->group map once
         self._layer_map = self._build_layer_to_group_map(raise_if_duplicate=True)
 
         # 3) If num_layers is set, validate no group references a layer_idx >= num_layers
         if self.num_layers is not None:
             self._validate_num_layers()
+
+    def _validate_quantization_config(self):
+        """Validate quantizer-specific options before a long prefill starts."""
+        if self.kv_quantizer not in ("rtn", "turboquant_mse"):
+            raise ValueError(
+                f"Invalid kv_quantizer '{self.kv_quantizer}'. "
+                "Must be 'rtn' or 'turboquant_mse'."
+            )
+
+        if not isinstance(self.kv_bits, int) or isinstance(self.kv_bits, bool):
+            raise TypeError("kv_bits must be an integer")
+        if not 1 <= self.kv_bits <= 16:
+            raise ValueError("kv_bits must be between 1 and 16")
+
+        if self.kv_quantizer == "rtn":
+            if self.k_bits is not None or self.v_bits is not None:
+                raise ValueError(
+                    "k_bits/v_bits are only supported by kv_quantizer="
+                    "'turboquant_mse'; legacy RTN uses kv_bits for both sides"
+                )
+            return
+
+        if self.layer_merge_impl != "svd":
+            raise ValueError("TurboQuant-MSE is only supported with SVD merging")
+        if not (self.merge_key or self.merge_value):
+            raise ValueError(
+                "TurboQuant-MSE requires merge_key and/or merge_value; "
+                "otherwise no factor would be quantized"
+            )
+        if self.hadamard:
+            raise ValueError(
+                "TurboQuant-MSE already applies a dense Haar rotation; "
+                "set hadamard=False instead of stacking the xKV Hadamard path"
+            )
+        if self.group_size != 0 or self.sym or self.clip_ratio != 1.0:
+            raise ValueError(
+                "group_size, sym, and clip_ratio are RTN-only options and must "
+                "keep their defaults for TurboQuant-MSE"
+            )
+        if not isinstance(self.turboquant_rotation_seed, int) or isinstance(
+            self.turboquant_rotation_seed, bool
+        ):
+            raise TypeError("turboquant_rotation_seed must be an integer")
+        if self.turboquant_chunk_size is not None and (
+            not isinstance(self.turboquant_chunk_size, int)
+            or isinstance(self.turboquant_chunk_size, bool)
+            or self.turboquant_chunk_size <= 0
+        ):
+            raise ValueError(
+                "turboquant_chunk_size must be None or a positive integer"
+            )
+
+        for side, enabled in (("k", self.merge_key), ("v", self.merge_value)):
+            if not enabled:
+                continue
+            bits = self.quant_bits_for(side)
+            if not isinstance(bits, int) or isinstance(bits, bool):
+                raise TypeError(f"{side}_bits must resolve to an integer")
+            if not 1 <= bits <= 4:
+                raise ValueError(
+                    f"TurboQuant {side.upper()} bits must be between 1 and 4; "
+                    f"got {bits}. Set {side}_bits explicitly or use kv_bits as "
+                    "a symmetric fallback."
+                )
+
+    def quant_bits_for(self, side: str) -> int:
+        """Return the effective quantization bits for ``'k'`` or ``'v'``."""
+        if side == "k":
+            return self.kv_bits if self.k_bits is None else self.k_bits
+        if side == "v":
+            return self.kv_bits if self.v_bits is None else self.v_bits
+        raise ValueError("side must be 'k' or 'v'")
+
+    def _validate_turboquant_groups(self):
+        """Validate finalized ranks and the cache's consecutive-group contract."""
+        if not self.layer_groups:
+            raise ValueError(
+                "TurboQuant-MSE requires at least one layer group; an empty "
+                "group list would silently skip quantization"
+            )
+        for group_index, group in enumerate(self.layer_groups):
+            expected_layers = list(range(group.layers[0], group.layers[-1] + 1))
+            if group.layers != expected_layers:
+                raise ValueError(
+                    "TurboQuant xKV groups must contain sorted consecutive "
+                    f"layers; group {group_index} has {group.layers}"
+                )
+            for side, enabled in (
+                ("k", self.merge_key),
+                ("v", self.merge_value),
+            ):
+                if not enabled:
+                    continue
+                rank = group.rank_k if side == "k" else group.rank_v
+                if (
+                    not isinstance(rank, int)
+                    or isinstance(rank, bool)
+                    or rank < 2
+                ):
+                    raise ValueError(
+                        f"TurboQuant group {group_index} {side.upper()} rank "
+                        f"must be an integer at least 2; got {rank!r}"
+                    )
     
     def _validate_num_layers(self):
         """
@@ -192,6 +315,17 @@ class xKVConfig:
         conf_data = raw.get("xKV_config", {})
         group_data = conf_data.pop("layer_groups", [])
 
+        # A custom table path in YAML is relative to that YAML file, not to the
+        # process working directory used to launch evaluation.
+        codebook_path = conf_data.get("turboquant_codebook_path")
+        if codebook_path is not None:
+            codebook_path = Path(codebook_path).expanduser()
+            if not codebook_path.is_absolute():
+                codebook_path = Path(path).resolve().parent / codebook_path
+            conf_data["turboquant_codebook_path"] = str(
+                codebook_path.resolve()
+            )
+
         # Build LayerGroup objects
         groups = [LayerGroup(**gd) for gd in group_data]
         return cls(layer_groups=groups, **conf_data)
@@ -210,11 +344,17 @@ class xKVConfig:
             "slerp_gamma": self.slerp_gamma,
             "merge_key": self.merge_key,
             "merge_value": self.merge_value,
+            "kv_quantizer": self.kv_quantizer,
             "kv_bits": self.kv_bits,
+            "k_bits": self.k_bits,
+            "v_bits": self.v_bits,
             "group_size": self.group_size,
             "sym": self.sym,
             "clip_ratio": self.clip_ratio,
             "hadamard": self.hadamard,
+            "turboquant_rotation_seed": self.turboquant_rotation_seed,
+            "turboquant_chunk_size": self.turboquant_chunk_size,
+            "turboquant_codebook_path": self.turboquant_codebook_path,
         }
         d.update(self.extra_kwargs)
         return d
@@ -256,8 +396,19 @@ class xKVConfig:
         lines.append(f"  slerp_t={self.slerp_t!r}, slerp_gamma={self.slerp_gamma!r},")
         lines.append(f"  merge_key={self.merge_key}, merge_value={self.merge_value},")
         lines.append(f"  # Quantizer params:")
-        lines.append(f"  kv_bits={self.kv_bits}, group_size={self.group_size},")
+        lines.append(
+            f"  kv_quantizer={self.kv_quantizer!r}, kv_bits={self.kv_bits}, "
+            f"k_bits={self.k_bits!r}, v_bits={self.v_bits!r},"
+        )
+        lines.append(f"  group_size={self.group_size},")
         lines.append(f"  sym={self.sym}, clip_ratio={self.clip_ratio}, hadamard={self.hadamard},")
+        lines.append(
+            f"  turboquant_rotation_seed={self.turboquant_rotation_seed}, "
+            f"turboquant_chunk_size={self.turboquant_chunk_size!r},"
+        )
+        lines.append(
+            f"  turboquant_codebook_path={self.turboquant_codebook_path!r},"
+        )
         lines.append(f"  # {len(self.layer_groups)} groups:")
         for idx, grp in enumerate(self.layer_groups):
             grp_repr = repr(grp).replace("\n", "\n    ")
@@ -310,6 +461,13 @@ def generate_consecutive_xKV_config(
     clip_ratio: float = 1.0,
     hadamard: bool = True,
     extra_kwargs: dict = None,
+    *,
+    kv_quantizer: str = "rtn",
+    k_bits: Optional[int] = None,
+    v_bits: Optional[int] = None,
+    turboquant_rotation_seed: int = 42,
+    turboquant_chunk_size: Optional[int] = 4096,
+    turboquant_codebook_path: Optional[str] = None,
 ) -> xKVConfig:
     """
     Quickly build a xKVConfig with consecutive-layer groups.
@@ -322,11 +480,17 @@ def generate_consecutive_xKV_config(
       rank_k, rank_v: Global SVD defaults (if 'svd' method)
       slerp_t, slerp_gamma: Global SLERP defaults (if 'slerp' method)
       merge_key, merge_value: Whether to apply merges to key/value
-      kv_bits: KV cache bit width, 16 means no quantization
+      kv_quantizer: Quantizer implementation ("rtn" or "turboquant_mse")
+      kv_bits: Shared bit width; 16 disables legacy RTN and is the fallback for
+        unspecified k_bits/v_bits
+      k_bits, v_bits: Optional per-side bit widths for TurboQuant-MSE
       quantizer_group_size: Group size for quantization, 0 means per-token quantization
       sym: Use symmetric quantization
       clip_ratio: Clip ratio for quantization
       hadamard: Use Hadamard transform for quantization
+      turboquant_rotation_seed: Deterministic Haar rotation seed
+      turboquant_chunk_size: Row chunk size for the accuracy reference codec
+      turboquant_codebook_path: Optional offline codebook JSON override
       extra_kwargs: Additional fields stored in the config
 
     Returns:
@@ -348,11 +512,17 @@ def generate_consecutive_xKV_config(
         merge_key=merge_key,
         merge_value=merge_value,
         # Quantization parameters
+        kv_quantizer=kv_quantizer,
         kv_bits=kv_bits,
+        k_bits=k_bits,
+        v_bits=v_bits,
         group_size=quantizer_group_size,
         sym=sym,
         clip_ratio=clip_ratio,
         hadamard=hadamard,
+        turboquant_rotation_seed=turboquant_rotation_seed,
+        turboquant_chunk_size=turboquant_chunk_size,
+        turboquant_codebook_path=turboquant_codebook_path,
         layer_groups=layer_groups,
         extra_kwargs=extra_kwargs or {}
     )

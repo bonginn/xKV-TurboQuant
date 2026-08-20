@@ -25,6 +25,11 @@ import json
 import datetime
 
 from data.dataset import Dataset
+from xKV.runtime_audit import (
+    record_hf_generation,
+    reset_runtime_audit,
+    summarize_runtime_audit,
+)
 
 
 def _is_custom_llm(llm):
@@ -38,15 +43,43 @@ def _model_name(llm):
 
 def _hf_generate(llm, tokenizer, prompt, gen_len, **kwargs):
     """Run HF model.generate and return decoded string list."""
+    runtime_audit = getattr(llm, "xkv_runtime_audit", None)
+    generation_kwargs = dict(kwargs)
+    if runtime_audit is not None:
+        generation_kwargs["return_dict_in_generate"] = True
+        generation_kwargs["output_scores"] = True
+
     rets = llm.generate(
         **(prompt.to(llm.device)),
         max_new_tokens=gen_len,
         top_p=1.0, temperature=0.0,
         do_sample=False,
         pad_token_id=tokenizer.eos_token_id,
-        **kwargs,
+        **generation_kwargs,
     )
-    return [tokenizer.decode(rets[0][prompt.input_ids.shape[-1]:], skip_special_tokens=True)]
+    if runtime_audit is None:
+        sequences = rets
+    else:
+        sequences = rets.sequences
+        scores = tuple(rets.scores or ())
+        # Generation scores are post-processor values: -inf can be a valid
+        # token-suppression mask.  Reject NaN/+inf and rows with no finite
+        # candidate instead of treating every -inf as a model failure.
+        invalid_scores = sum(
+            bool(torch.isnan(score).any().item())
+            or bool(torch.isposinf(score).any().item())
+            or not bool(torch.isfinite(score).any(dim=-1).all().item())
+            for score in scores
+        )
+        record_hf_generation(
+            runtime_audit,
+            generated_tokens=(
+                sequences.shape[-1] - prompt.input_ids.shape[-1]
+            ),
+            score_tensors_checked=len(scores),
+            invalid_score_tensors=invalid_scores,
+        )
+    return [tokenizer.decode(sequences[0][prompt.input_ids.shape[-1]:], skip_special_tokens=True)]
 
 
 class Evaluator:
@@ -56,6 +89,15 @@ class Evaluator:
 
     def test(self, llm, tokenizer, dataset: Dataset, output_path: str, setting: str = 'baseline'):
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        runtime_audit = getattr(llm, "xkv_runtime_audit", None)
+        custom_cache = getattr(llm, "kv_cache", None) if _is_custom_llm(llm) else None
+        xkvsr_quant_audit = bool(
+            getattr(custom_cache, "quant_audit_enabled", False)
+        )
+        if runtime_audit is not None:
+            reset_runtime_audit(runtime_audit)
+        if xkvsr_quant_audit:
+            custom_cache.reset_quant_audit()
         if self.dist_config.master_process:
             print(colored(f"[Test] {_model_name(llm)} on {dataset.dataset_name}, results saved to {output_path}", 'green'))
 
@@ -191,6 +233,34 @@ class Evaluator:
 
         progress_bar.close()
         avg_score = sum(scores) / len(scores) if scores else 0.0
+
+        if runtime_audit is not None:
+            audit_summary = summarize_runtime_audit(runtime_audit)
+            if self.dist_config.master_process:
+                print(
+                    "[XKV_RUNTIME_AUDIT] "
+                    + json.dumps(audit_summary, sort_keys=True),
+                    flush=True,
+                )
+            if audit_summary["status"] != "PASS":
+                raise RuntimeError(
+                    "xKV runtime audit failed: "
+                    + "; ".join(audit_summary["errors"])
+                )
+
+        if xkvsr_quant_audit:
+            audit_summary = custom_cache.quant_audit_summary()
+            if self.dist_config.master_process:
+                print(
+                    "[XKV_SR_QUANT_AUDIT] "
+                    + json.dumps(audit_summary, sort_keys=True),
+                    flush=True,
+                )
+            if audit_summary["status"] != "PASS":
+                raise RuntimeError(
+                    "xKV-SR quantization audit failed: "
+                    + "; ".join(audit_summary.get("errors", []))
+                )
 
         self.all_stats.append({
             'model': _model_name(llm),

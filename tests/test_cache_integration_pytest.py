@@ -72,8 +72,8 @@ class TestCacheIntegration:
         cache.update(key1, value1, layer_idx=1, mode='prefill', re_apply_rope=False)
         
         # Verify cache contents
-        cached_key0, cached_value0 = cache.key_cache[0], cache.value_cache[0]
-        cached_key1, cached_value1 = cache.key_cache[1], cache.value_cache[1]
+        cached_key0, cached_value0 = cache.get_layer_cache(0)
+        cached_key1, cached_value1 = cache.get_layer_cache(1)
         
         # Check shapes are preserved
         assert cached_key0.shape == key0.shape
@@ -109,8 +109,8 @@ class TestCacheIntegration:
         cache.update(key1, value1, layer_idx=1, mode='prefill', re_apply_rope=False)
         
         # Get processed tensors
-        cached_key0, cached_value0 = cache.key_cache[0], cache.value_cache[0]
-        cached_key1, cached_value1 = cache.key_cache[1], cache.value_cache[1]
+        cached_key0, cached_value0 = cache.get_layer_cache(0)
+        cached_key1, cached_value1 = cache.get_layer_cache(1)
         
         # Calculate processed norms
         cached_key_norm = (cached_key0.norm() + cached_key1.norm()).item()

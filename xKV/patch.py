@@ -1,5 +1,10 @@
+import logging
 from typing import Dict, Optional
-from loguru import logger
+
+try:
+    from loguru import logger
+except ImportError:  # loguru is optional in offline inference environments.
+    logger = logging.getLogger(__name__)
 
 from transformers.cache_utils import Cache, DynamicCache
 from .attn_patch.mistral import enable_mistral_xKV_eval
@@ -8,9 +13,14 @@ from .attn_patch.qwen import enable_qwen_xKV_eval
 from .attn_patch.deepseek_v2 import enable_deepseek_v2_xKV_eval
 from .customized_cache import method_to_cache_obj
 from .configurations import xKVConfig
+from .runtime_audit import create_runtime_audit
 
-def prepare_cache(method: str, config):
+def prepare_cache(method: str, config, runtime_audit=None):
     cache_obj: Cache = method_to_cache_obj.get(method, None)
+    # HF creates a fresh cache for every generate() call.  Keep deterministic
+    # TurboQuant rotations/codebooks alive at model-patch scope so RULER does
+    # not repeat a large QR decomposition for every sample.
+    turboquant_registry = {}
 
     def _prepare_cache_for_generation(
         self, generation_config, model_kwargs: Dict, *args, **kwargs
@@ -23,7 +33,11 @@ def prepare_cache(method: str, config):
         if cache_obj is None:
             model_kwargs["past_key_values"] = DynamicCache()
         else:
-            model_kwargs["past_key_values"] = cache_obj(config)
+            model_kwargs["past_key_values"] = cache_obj(
+                config,
+                turboquant_registry=turboquant_registry,
+                runtime_audit=runtime_audit,
+            )
 
     return _prepare_cache_for_generation
 
@@ -65,7 +79,19 @@ class KVCompress:
             raise ValueError("Model type not supported for xKV patch: {}".format(model.config.model_type))
         
         model.kv_compress_config = self.config
-        prepare_cache_fn = prepare_cache("xKV", self.config)
+        runtime_audit = create_runtime_audit(
+            self.config,
+            model_num_layers=model.config.num_hidden_layers,
+        )
+        if runtime_audit is not None:
+            model.xkv_runtime_audit = runtime_audit
+        elif hasattr(model, "xkv_runtime_audit"):
+            delattr(model, "xkv_runtime_audit")
+        prepare_cache_fn = prepare_cache(
+            "xKV",
+            self.config,
+            runtime_audit=runtime_audit,
+        )
         model._prepare_cache_for_generation = prepare_cache_fn.__get__(
             model, model.__class__
         )

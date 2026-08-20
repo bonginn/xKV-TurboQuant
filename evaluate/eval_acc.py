@@ -129,6 +129,73 @@ def parse_args() -> Namespace:
 # xKV-SR pipeline (custom LLM engine)
 # ---------------------------------------------------------------------------
 
+def _xkvsr_effective_bits(args):
+    k_bits = args.kv_bits if args.k_bits is None else args.k_bits
+    v_bits = args.kv_bits if args.v_bits is None else args.v_bits
+    return k_bits, v_bits
+
+
+def _xkvsr_setting(args):
+    """Return a non-colliding result key for the xKV-SR accuracy path."""
+
+    if args.kv_quantizer == "turboquant_mse":
+        k_bits, v_bits = _xkvsr_effective_bits(args)
+        k_label = "bf16" if k_bits == 16 else str(k_bits)
+        v_label = "bf16" if v_bits == 16 else str(v_bits)
+        return f"{args.method}_tqmse_native_k{k_label}v{v_label}_fq"
+    return args.method
+
+
+def _configure_xkvsr_factor_quantization(llm, args):
+    """Apply only quantization modes implemented by the xKV-SR reference cache."""
+
+    if args.kv_quantizer == "turboquant_mse":
+        if args.method != "xkv_sr":
+            raise ValueError(
+                "TurboQuant factor-pair quantization is currently implemented "
+                "only for --method xkv_sr"
+            )
+        if args.fake_svd:
+            raise ValueError(
+                "xKV-SR TurboQuant requires real persistent SVD factors; "
+                "remove --fake_svd"
+            )
+        if args.hadamard:
+            raise ValueError(
+                "TurboQuant already applies a Haar rotation; do not combine it "
+                "with --hadamard"
+            )
+        if args.group_size != 0 or args.sym or args.clip_ratio != 1.0:
+            raise ValueError(
+                "--group_size, --sym, and --clip_ratio are RTN-only options; "
+                "keep their defaults for xKV-SR TurboQuant"
+            )
+        k_bits, v_bits = _xkvsr_effective_bits(args)
+        if k_bits == 16 and v_bits == 16:
+            raise ValueError(
+                "xKV-SR TurboQuant requires at least one quantized side; "
+                "omit --kv_quantizer turboquant_mse for the BF16 baseline"
+            )
+        llm.kv_cache.configure_turboquant(
+            k_bits=k_bits,
+            v_bits=v_bits,
+            rotation_seed=args.turboquant_rotation_seed,
+            chunk_size=args.turboquant_chunk_size,
+            codebook_path=args.turboquant_codebook_path,
+        )
+        return
+
+    if args.k_bits is not None or args.v_bits is not None:
+        raise ValueError(
+            "--k_bits/--v_bits require --kv_quantizer turboquant_mse"
+        )
+    if args.kv_bits < 16:
+        raise ValueError(
+            "RTN factor quantization is not implemented in the xKV-SR "
+            "accuracy cache yet; use --kv_bits 16 or TurboQuant-MSE"
+        )
+
+
 def run_xkv_sr(args, dist_config):
     from xKV_SR.models import choose_model_class
     from evaluator import Evaluator
@@ -157,6 +224,8 @@ def run_xkv_sr(args, dist_config):
         group_size=args.layer_group_size,
         fake_svd=args.fake_svd,
     )
+    _configure_xkvsr_factor_quantization(llm, args)
+    setting = _xkvsr_setting(args)
 
     if dist_config.master_process:
         llm.print_kv_stats()
@@ -169,11 +238,11 @@ def run_xkv_sr(args, dist_config):
         )
         archive_path = (
             f"temporary/{model_name.split('/')[-1]}/"
-            f"{dataset_name}_{args.datalen}_{args.method}"
+            f"{dataset_name}_{args.datalen}_{setting}"
             f"_b{args.sparse_budget}_c{args.chunk_size}"
             f"_x{args.layer_group_size}_r{args.rank}_k{args.rank_k}_v{args.rank_v}.jsonl"
         )
-        evaluator.test(llm, llm.tokenizer, dataset, archive_path, setting=args.method)
+        evaluator.test(llm, llm.tokenizer, dataset, archive_path, setting=setting)
 
         df = evaluator.summarize()
         if dist_config.master_process:
@@ -203,8 +272,20 @@ def _xkv_setting(args):
     """Return setting key for result logging."""
     m = args.method
     if m == "xkv":
+        if args.customized_merge_config:
+            config_name = os.path.splitext(
+                os.path.basename(args.customized_merge_config)
+            )[0]
+            return f"xkv_custom_{config_name}"
         if args.layer_merge_impl == "slerp":
             return f"minicache_l{args.start_layer_idx}_{args.end_layer_idx}"
+        elif args.kv_quantizer == "turboquant_mse":
+            k_bits = args.kv_bits if args.k_bits is None else args.k_bits
+            v_bits = args.kv_bits if args.v_bits is None else args.v_bits
+            return (
+                f"xkv{args.layer_group_size}_k{args.rank_k}_v{args.rank_v}"
+                f"_tqmse_k{k_bits}v{v_bits}"
+            )
         elif args.kv_bits < 16:
             return f"xkv{args.layer_group_size}_k{args.rank_k}_v{args.rank_v}_{args.kv_bits}bit"
         else:

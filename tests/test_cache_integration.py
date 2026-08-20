@@ -63,8 +63,8 @@ def test_integration(cache_instance, test_tensors):
     cache_instance.update(key1, value1, layer_idx=1, mode='prefill', re_apply_rope=False)
     
     # Verify cache contents
-    cached_key0, cached_value0 = cache_instance.key_cache[0], cache_instance.value_cache[0]
-    cached_key1, cached_value1 = cache_instance.key_cache[1], cache_instance.value_cache[1]
+    cached_key0, cached_value0 = cache_instance.get_layer_cache(0)
+    cached_key1, cached_value1 = cache_instance.get_layer_cache(1)
     
     # Check shapes are preserved
     assert cached_key0.shape == key0.shape

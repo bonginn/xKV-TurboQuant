@@ -20,9 +20,11 @@ import torch
 import math
 from torch import nn
 from .merge_configs import xKVConfig
+from .factor_quant import TurboQuantFactorQuantizer
 
 from .tensor_op import batch_gather_gemm_rotary_pos_emb_cuda
 from xKV_SR.kernels import shadowkv
+from xKV.runtime_audit import runtime_audit_enabled
 
 
 def fake_svd(tensor, rank):
@@ -464,10 +466,331 @@ class ShadowKVCache_xKV:
         self.errors = []
         self.relative_errors = []
 
+        # Optional accuracy-only factor quantization.  The default path remains
+        # byte-for-byte xKV-SR FP16/BF16 factor storage until explicitly
+        # configured by the evaluator.
+        self.factor_quantizer = None
+        self.factor_quantization = None
+        self.quant_audit_enabled = False
+        self._quant_audit = {}
+        self.reset_quant_audit()
+
         self.copy_stream = torch.cuda.Stream()
 
     def print_stats(self):
-        print(f"ShadowKV_xKV | sparse budget {self.sparse_budget} | chunk size {self.chunk_size} | group_size {self.group_size} | rank_k {self.rank_k} | rank_v {self.rank_v} | cached {self.kv_offset} | local_chunk {self.local_chunk} | outlier_chunk {self.outlier_chunk}")
+        if self.factor_quantization is None:
+            factor_quant = "none (dense BF16 factors)"
+        else:
+            k_label = (
+                "BF16"
+                if self.factor_quantization.k_bits == 16
+                else str(self.factor_quantization.k_bits)
+            )
+            v_label = (
+                "BF16"
+                if self.factor_quantization.v_bits == 16
+                else str(self.factor_quantization.v_bits)
+            )
+            factor_quant = (
+                "turboquant_mse fake-quant "
+                f"K{k_label}V{v_label} "
+                f"(dequantized {self.dtype} factors; not packed)"
+            )
+        print(f"ShadowKV_xKV | sparse budget {self.sparse_budget} | chunk size {self.chunk_size} | group_size {self.group_size} | rank_k {self.rank_k} | rank_v {self.rank_v} | factor_quant {factor_quant} | cached {self.kv_offset} | local_chunk {self.local_chunk} | outlier_chunk {self.outlier_chunk}")
+
+    def configure_turboquant(
+        self,
+        *,
+        k_bits,
+        v_bits,
+        rotation_seed=42,
+        chunk_size=4096,
+        codebook_path=None,
+    ):
+        """Enable accuracy-only TurboQuant on the persistent SVD factors."""
+
+        if self.U_k or self.U_v or self.SV_k or self.SV_v:
+            raise RuntimeError(
+                "configure_turboquant must run before the first xKV-SR prefill"
+            )
+        if self.num_layers % self.group_size != 0:
+            raise ValueError(
+                "xKV-SR TurboQuant currently requires num_layers to be "
+                "divisible by layer_group_size; partial groups are not "
+                "implemented by the reference cache"
+            )
+        self.quant_audit_enabled = runtime_audit_enabled()
+        self.factor_quantization = TurboQuantFactorQuantizer(
+            rank_k=self.rank_k,
+            rank_v=self.rank_v,
+            k_bits=k_bits,
+            v_bits=v_bits,
+            rotation_seed=rotation_seed,
+            chunk_size=chunk_size,
+            codebook_path=codebook_path,
+            device=self.device,
+        )
+        self.factor_quantizer = "turboquant_mse"
+        self.reset_quant_audit()
+
+    def reset_quant_audit(self):
+        """Reset dataset-level counters without touching persistent factors."""
+
+        self._quant_audit = {
+            "prefill_calls": 0,
+            "group_merges": 0,
+            "k_pair_calls": 0,
+            "v_pair_calls": 0,
+            "pair_signatures": {},
+            "factor_pairs_checked": 0,
+            "k_reconstruction_calls": 0,
+            "v_reconstruction_calls": 0,
+            "reconstruction_tensors_checked": 0,
+            "nonfinite_factors": 0,
+            "nonfinite_reconstructions": 0,
+            "factor_diagnostics": {
+                side: {
+                    "pairs": 0,
+                    "source_left_sumsq": 0.0,
+                    "quantized_left_error_sumsq": 0.0,
+                    "stored_left_cast_error_sumsq": 0.0,
+                    "folded_right_sumsq": 0.0,
+                    "stored_right_cast_error_sumsq": 0.0,
+                    "code_count": 0,
+                    "zero_norm_rows": 0,
+                    "code_histogram": None,
+                    "logical_index_bytes": 0,
+                    "logical_packed_bits": 0,
+                    "norm_bytes": 0,
+                }
+                for side in ("k", "v")
+            },
+        }
+
+    def _record_factor_diagnostic(self, side, pair, source_left, stored_left, stored_right):
+        """Accumulate opt-in factor distortion and logical-code coverage."""
+        if not self.quant_audit_enabled:
+            return
+        stats = self._quant_audit["factor_diagnostics"][side]
+        codec = self.factor_quantization.codec_for(side)
+        source = source_left.float()
+        quantized_rotated = pair.left_factor.float()
+        quantized_decoded = codec.decode(
+            pair.codes,
+            output_dtype=torch.float32,
+        )
+        folded_right = pair.right_factor.float()
+        stats["pairs"] += 1
+        stats["source_left_sumsq"] += float(source.square().sum().item())
+        # The stored left factor remains in rotated coordinates because the
+        # inverse rotation is folded into the right factor. Decode it before
+        # comparing with the source U.
+        stats["quantized_left_error_sumsq"] += float(
+            (quantized_decoded - source).square().sum().item()
+        )
+        stats["stored_left_cast_error_sumsq"] += float(
+            (stored_left.float() - quantized_rotated).square().sum().item()
+        )
+        stats["folded_right_sumsq"] += float(folded_right.square().sum().item())
+        stats["stored_right_cast_error_sumsq"] += float((stored_right.float() - folded_right).square().sum().item())
+        indices = pair.codes.indices.reshape(-1)
+        histogram = torch.bincount(indices.to(torch.long), minlength=codec.levels).cpu().tolist()
+        stats["code_histogram"] = histogram if stats["code_histogram"] is None else [old + new for old, new in zip(stats["code_histogram"], histogram)]
+        stats["code_count"] += indices.numel()
+        stats["zero_norm_rows"] += int((pair.codes.norms == 0).sum().item())
+        stats["logical_index_bytes"] += indices.numel() * pair.codes.indices.element_size()
+        stats["logical_packed_bits"] += indices.numel() * codec.bits
+        stats["norm_bytes"] += pair.codes.norms.numel() * pair.codes.norms.element_size()
+    def _record_quantized_pair(
+        self,
+        side,
+        pair,
+        stored_left_factor,
+        stored_right_factor,
+    ):
+        if not self.quant_audit_enabled:
+            return
+
+        is_finite = bool(torch.isfinite(pair.left_factor).all().item()) and bool(
+            torch.isfinite(pair.right_factor).all().item()
+        )
+        is_finite = (
+            is_finite
+            and bool(torch.isfinite(stored_left_factor).all().item())
+            and bool(torch.isfinite(stored_right_factor).all().item())
+        )
+        self._quant_audit["factor_pairs_checked"] += 1
+        if not is_finite:
+            self._quant_audit["nonfinite_factors"] += 1
+            raise RuntimeError(
+                f"xKV-SR TurboQuant {side.upper()} factors contain non-finite values"
+            )
+
+        self._quant_audit[f"{side}_pair_calls"] += 1
+        codec = self.factor_quantization.codec_for(side)
+        signature = {
+            "side": side,
+            "rank": int(codec.dimension),
+            "bits": int(codec.bits),
+            "rotation_seed": int(codec.rotation_seed),
+            "chunk_size": codec.chunk_size,
+            "codebook_checksum": str(codec.codebook_checksum),
+            "rotation_checksum": str(codec.rotation_checksum),
+            "indices_dtype": str(pair.codes.indices.dtype),
+            "norms_dtype": str(pair.codes.norms.dtype),
+            "source_factor_dtype": str(pair.codes.source_dtype),
+            "stored_left_dtype": str(stored_left_factor.dtype),
+            "stored_right_dtype": str(stored_right_factor.dtype),
+        }
+        existing = self._quant_audit["pair_signatures"].get(side)
+        if existing is None:
+            signature["calls"] = 1
+            self._quant_audit["pair_signatures"][side] = signature
+            return
+        for key, value in signature.items():
+            if existing[key] != value:
+                raise RuntimeError(
+                    f"xKV-SR TurboQuant {side.upper()} codec signature changed "
+                    f"within one evaluation: {key}"
+                )
+        existing["calls"] += 1
+
+    def _record_quantized_reconstruction(self, side, tensor):
+        if not self.quant_audit_enabled:
+            return
+        self._quant_audit[f"{side}_reconstruction_calls"] += 1
+
+        # A single finite check per side proves the stored folded factors enter
+        # the decode path without synchronizing every layer/token reconstruction.
+        already_checked = self._quant_audit.get(
+            f"{side}_reconstruction_checked", False
+        )
+        if already_checked:
+            return
+        is_finite = bool(torch.isfinite(tensor).all().item())
+        self._quant_audit[f"{side}_reconstruction_checked"] = True
+        self._quant_audit["reconstruction_tensors_checked"] += 1
+        if not is_finite:
+            self._quant_audit["nonfinite_reconstructions"] += 1
+            raise RuntimeError(
+                f"xKV-SR TurboQuant {side.upper()} reconstruction is non-finite"
+            )
+
+    def quant_audit_summary(self):
+        """Return fail-closed evidence for an audited xKV-SR TQ evaluation."""
+
+        if not self.quant_audit_enabled or self.factor_quantization is None:
+            return {"status": "DISABLED", "quantization_executed": False}
+
+        audit = self._quant_audit
+        enabled_sides = tuple(
+            side
+            for side in ("k", "v")
+            if self.factor_quantization.is_enabled(side)
+        )
+        expected_group_merges = (
+            audit["prefill_calls"] * (self.num_layers // self.group_size)
+        )
+        errors = []
+        if audit["prefill_calls"] == 0:
+            errors.append("no xKV-SR prefill was observed")
+        if audit["group_merges"] != expected_group_merges:
+            errors.append(
+                "group merge count mismatch: "
+                f"expected {expected_group_merges}, got {audit['group_merges']}"
+            )
+        for side in ("k", "v"):
+            calls = audit[f"{side}_pair_calls"]
+            expected_calls = (
+                audit["group_merges"] if side in enabled_sides else 0
+            )
+            if calls != expected_calls:
+                errors.append(
+                    f"{side.upper()} pair-call mismatch: expected "
+                    f"{expected_calls}, got {calls}"
+                )
+            reconstruction_calls = audit[f"{side}_reconstruction_calls"]
+            if side in enabled_sides and reconstruction_calls == 0:
+                errors.append(
+                    f"no quantized {side.upper()} factor reconstruction was observed"
+                )
+            if side not in enabled_sides and reconstruction_calls != 0:
+                errors.append(
+                    f"bypassed {side.upper()} unexpectedly recorded "
+                    f"{reconstruction_calls} quantized reconstruction(s)"
+                )
+        if audit["factor_pairs_checked"] != (
+            audit["k_pair_calls"] + audit["v_pair_calls"]
+        ):
+            errors.append("not every TurboQuant factor pair received a finite check")
+        if audit["reconstruction_tensors_checked"] != len(enabled_sides):
+            errors.append(
+                "quantized-side reconstruction finite-check mismatch: "
+                f"expected {len(enabled_sides)}, got "
+                f"{audit['reconstruction_tensors_checked']}"
+            )
+        if audit["nonfinite_factors"]:
+            errors.append(f"found {audit['nonfinite_factors']} non-finite factor pairs")
+        if audit["nonfinite_reconstructions"]:
+            errors.append(
+                "found "
+                f"{audit['nonfinite_reconstructions']} non-finite reconstructions"
+            )
+
+        signatures = [
+            audit["pair_signatures"][side]
+            for side in ("k", "v")
+            if side in audit["pair_signatures"]
+        ]
+        return {
+            "status": "PASS" if not errors else "FAIL",
+            "errors": errors,
+            "mode": "turboquant_mse_fake",
+            "quantization_executed": (
+                not errors
+                and bool(enabled_sides)
+                and all(audit[f"{side}_pair_calls"] > 0 for side in enabled_sides)
+            ),
+            "quantized_sides": list(enabled_sides),
+            "bypassed_sides": [
+                side for side in ("k", "v") if side not in enabled_sides
+            ],
+            "factor_gauge": "U,SigmaVh",
+            "rank_k": int(self.rank_k),
+            "rank_v": int(self.rank_v),
+            "k_bits": int(self.factor_quantization.k_bits),
+            "v_bits": int(self.factor_quantization.v_bits),
+            "prefill_calls": int(audit["prefill_calls"]),
+            "group_merges": int(audit["group_merges"]),
+            "expected_group_merges": int(expected_group_merges),
+            "k_pair_calls": int(audit["k_pair_calls"]),
+            "v_pair_calls": int(audit["v_pair_calls"]),
+            "k_reconstruction_calls": int(audit["k_reconstruction_calls"]),
+            "v_reconstruction_calls": int(audit["v_reconstruction_calls"]),
+            "pair_signatures": signatures,
+            "factor_diagnostics": {
+                side: audit["factor_diagnostics"][side]
+                for side in enabled_sides
+            },
+            "factor_pairs_checked": int(audit["factor_pairs_checked"]),
+            "reconstruction_tensors_checked": int(
+                audit["reconstruction_tensors_checked"]
+            ),
+            "nonfinite_factors": int(audit["nonfinite_factors"]),
+            "nonfinite_reconstructions": int(
+                audit["nonfinite_reconstructions"]
+            ),
+            "persistent_storage": "dequantized_model_dtype",
+            "cache_dtype": str(self.dtype),
+            "logical_indices_dtype": "torch.uint8",
+            "physically_packed": False,
+            "dense_regions": [
+                "landmarks",
+                "local_tokens",
+                "outlier_chunks",
+                "decode_tail",
+            ],
+        }
 
     def get_svd(self, key, value, layer_idx, fake_svd=False):
         # [bsz, 8, prefill, 128] OR [bsz, prefill, 1024]
@@ -527,6 +850,47 @@ class ShadowKVCache_xKV:
             # Step 3: Apply real SVD
             U_trunc_k, SVh_trunc_k = svd(combined_key, self.rank_k)
             U_trunc_v, SVh_trunc_v = svd(combined_value, self.rank_v)
+
+            # Accuracy-only TurboQuant: quantize the token factor and fold the
+            # inverse rotation into the still-unsplit group decoder factor.
+            # Keep xKV-SR's existing U, Sigma*Vh factor gauge so the completed
+            # FP16 run remains the matched control.
+            if self.factor_quantizer == "turboquant_mse":
+                # Cast back to the same persistent dtype used by the completed
+                # xKV-SR baseline. Keeping FP32 factors here would confound
+                # quantization error with a higher-precision cache/control.
+                if self.factor_quantization.is_enabled("k"):
+                    source_U_trunc_k = U_trunc_k
+                    key_pair = self.factor_quantization.transform_pair(
+                        U_trunc_k,
+                        SVh_trunc_k,
+                        side="k",
+                    )
+                    U_trunc_k = key_pair.left_factor.to(U_trunc_k.dtype)
+                    SVh_trunc_k = key_pair.right_factor.to(SVh_trunc_k.dtype)
+                    self._record_quantized_pair(
+                        "k", key_pair, U_trunc_k, SVh_trunc_k
+                    )
+                    self._record_factor_diagnostic(
+                        "k", key_pair, source_U_trunc_k, U_trunc_k, SVh_trunc_k
+                    )
+                if self.factor_quantization.is_enabled("v"):
+                    source_U_trunc_v = U_trunc_v
+                    value_pair = self.factor_quantization.transform_pair(
+                        U_trunc_v,
+                        SVh_trunc_v,
+                        side="v",
+                    )
+                    U_trunc_v = value_pair.left_factor.to(U_trunc_v.dtype)
+                    SVh_trunc_v = value_pair.right_factor.to(SVh_trunc_v.dtype)
+                    self._record_quantized_pair(
+                        "v", value_pair, U_trunc_v, SVh_trunc_v
+                    )
+                    self._record_factor_diagnostic(
+                        "v", value_pair, source_U_trunc_v, U_trunc_v, SVh_trunc_v
+                    )
+                if self.quant_audit_enabled:
+                    self._quant_audit["group_merges"] += 1
             
             # Step 4: Reshape, split and store U, SV for each layer
             self.U_k.append(U_trunc_k)  # [bsz, seqlen, rank]
@@ -649,6 +1013,11 @@ class ShadowKVCache_xKV:
 
         # [bsz, 8, sparse_budget, rank] -matmul- [8, rank, 128] --> [bsz, 8, sparse_budget, 128]
         result = torch.einsum('bhrk,bhkd->bhrd', U_head, sv)
+        if (
+            self.factor_quantizer == "turboquant_mse"
+            and self.factor_quantization.is_enabled("v")
+        ):
+            self._record_quantized_reconstruction("v", result)
 
         # send to buffer
         self.v_cache_buffer[layer_idx][:, :, self.sparse_start:self.sparse_end].copy_(result, non_blocking=True)
@@ -677,6 +1046,11 @@ class ShadowKVCache_xKV:
 
         # [bsz, 8, sparse_budget, rank] -matmul- [8, rank, 128] --> [bsz, 8, sparse_budget, 128]
         result = torch.einsum('bhrk,bhkd->bhrd', U_head, sv)
+        if (
+            self.factor_quantizer == "turboquant_mse"
+            and self.factor_quantization.is_enabled("k")
+        ):
+            self._record_quantized_reconstruction("k", result)
 
         # rope the key cache
         result = rope_func(result, position_ids)
@@ -702,6 +1076,8 @@ class ShadowKVCache_xKV:
             self.gen_offset += incoming
 
     def clear(self):
+        if self.quant_audit_enabled:
+            self._quant_audit["prefill_calls"] += 1
         self.key_cache = []
         self.value_cache = []
         self.key_temp_buffer = []

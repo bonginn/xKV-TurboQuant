@@ -1,5 +1,6 @@
 import argparse
 import importlib
+import logging
 import numpy as np
 import random, torch
 from functools import reduce
@@ -7,7 +8,11 @@ from typing import Tuple, Any
 from xKV.patch import KVCompress
 from xKV.configurations import generate_consecutive_xKV_config
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from loguru import logger
+
+try:
+    from loguru import logger
+except ImportError:  # loguru is optional in offline inference environments.
+    logger = logging.getLogger(__name__)
 
 def get_obj_from_str(string, reload=False):
     module, cls = string.rsplit(".", 1)
@@ -68,6 +73,19 @@ def load_model_and_tokenizer(model_name_or_path, use_flash_attn2=False):
 def apply_kv_compress_patch(model, args, verbose=True) -> Tuple[Any, KVCompress]:
     logger.info("Generating the kv compress configs")
     if args.customized_merge_config:
+        if (
+            args.kv_quantizer != "rtn"
+            or args.k_bits is not None
+            or args.v_bits is not None
+            or args.turboquant_rotation_seed != 42
+            or args.turboquant_chunk_size != 4096
+            or args.turboquant_codebook_path is not None
+        ):
+            raise ValueError(
+                "--customized_merge_config is authoritative: put "
+                "kv_quantizer/k_bits/v_bits in the YAML instead of mixing "
+                "TurboQuant CLI flags with a custom config"
+            )
         logger.info(f"Loading the customized merge config from {args.customized_merge_config}")
         patch = KVCompress(yaml_path=args.customized_merge_config)
     else:
@@ -85,11 +103,17 @@ def apply_kv_compress_patch(model, args, verbose=True) -> Tuple[Any, KVCompress]
             start_layer=args.start_layer_idx,
             end_layer=args.end_layer_idx if args.end_layer_idx != -1 else model.config.num_hidden_layers - 1,
             # Add quantization parameters
+            kv_quantizer=args.kv_quantizer,
             kv_bits=args.kv_bits,
+            k_bits=args.k_bits,
+            v_bits=args.v_bits,
             quantizer_group_size=args.group_size,
             sym=args.sym,
             clip_ratio=args.clip_ratio,
             hadamard=args.hadamard,
+            turboquant_rotation_seed=args.turboquant_rotation_seed,
+            turboquant_chunk_size=args.turboquant_chunk_size,
+            turboquant_codebook_path=args.turboquant_codebook_path,
         )
         patch = KVCompress(xKV_config=xKV_config)
     
@@ -142,10 +166,22 @@ def add_common_args(parser: argparse.ArgumentParser):
     parser.add_argument('--customized_merge_config', type=str, help='custom config file')
     
     # Quantization parameters
+    parser.add_argument(
+        '--kv_quantizer',
+        type=str,
+        choices=['rtn', 'turboquant_mse'],
+        default='rtn',
+        help='Latent-factor quantizer. TurboQuant-MSE is the accuracy reference path.',
+    )
     parser.add_argument('--kv_bits', type=int, default=16, help='KV cache bit width, 16 means no quantization')
+    parser.add_argument('--k_bits', type=int, default=None, help='TurboQuant key bit width (falls back to kv_bits; xKV-SR accepts 16 as a key-side bypass)')
+    parser.add_argument('--v_bits', type=int, default=None, help='TurboQuant value bit width (falls back to kv_bits; xKV-SR accepts 16 as a value-side bypass)')
     parser.add_argument('--group_size', type=int, default=0, help='Group size for quantization, 0 means per-token quantization')
     parser.add_argument('--sym', action='store_true', help='Use symmetric quantization')
     parser.add_argument('--clip_ratio', type=float, default=1.0, help='Clip ratio for quantization')
     parser.add_argument('--hadamard', action='store_true', help='Use Hadamard transform for quantization')
+    parser.add_argument('--turboquant_rotation_seed', type=int, default=42, help='Deterministic TurboQuant Haar rotation seed')
+    parser.add_argument('--turboquant_chunk_size', type=int, default=4096, help='Rows per TurboQuant accuracy-path chunk')
+    parser.add_argument('--turboquant_codebook_path', type=str, default=None, help='Optional offline TurboQuant codebook JSON override')
     
     return parser
