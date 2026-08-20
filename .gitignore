@@ -166,3 +166,10 @@ cython_debug/
 /temporary/
 /results/
 /logs/
+
+# Local datasets and experiment artifacts
+/nltk_data/
+/nltk_data.zip
+/*_factor_diag_overnight.tar.gz
+/outputs/
+/evaluate/data/ruler/data/*/
