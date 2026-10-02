@@ -97,10 +97,13 @@ Quantization in the accuracy runs is simulated (the factors are quantized and im
 
 ## Reproduce
 
-Setup follows [README.md](README.md). Generate the 32K RULER data once:
+Setup follows [README.md](README.md). Generate the RULER data once; `create_dataset.sh` now also builds the 32K length:
 
 ```bash
-cd evaluate/data/ruler && bash create_dataset.sh Qwen/Qwen2.5-14B-Instruct-1M qwen && cd -
+bash scripts/build_datasets.sh
+# build_datasets.sh skips a model whose folder already exists. If evaluate/data/ruler/data/qwen
+# comes from an earlier 64K-only build, build the 32K data directly:
+(cd evaluate/data/ruler && bash create_dataset.sh Qwen/Qwen2.5-14B-Instruct-1M qwen)
 ```
 
 Kernel (no model, needs a CUDA GPU):
@@ -182,4 +185,4 @@ pytest tests/test_turboquant_packing.py tests/test_turboquant_mse.py tests/test_
 
 ## Credits
 
-xKV is by its authors (see [README.md](README.md)); TurboQuant is described in "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate" (arXiv:2504.19874). This fork is released under the same Apache-2.0 license ([LICENSE](LICENSE)).
+xKV is by its authors ([paper](https://arxiv.org/abs/2503.18893), [README.md](README.md)); TurboQuant is described in "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate" (arXiv:2504.19874). This fork is released under the same Apache-2.0 license ([LICENSE](LICENSE)).
