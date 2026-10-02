@@ -356,12 +356,16 @@ def main():
 
     avg_prefill_ms = sum(t[0] for t in all_timings) / len(all_timings) * 1000
     avg_load_ms = sum(t[1] for t in all_timings) / len(all_timings) * 1000
-    total_decode_s = sum(t[2] for t in all_timings)
-    total_steps = sum(t[3] for t in all_timings)
+    # The first sample's decode includes one-time Triton JIT compilation, so with
+    # more than one sample it is left out of the reported decode speed.
+    timed = all_timings[1:] if len(all_timings) > 1 else all_timings
+    total_decode_s = sum(t[2] for t in timed)
+    total_steps = sum(t[3] for t in timed)
     overall_ms_per_tok = (total_decode_s / total_steps * 1000) if total_steps > 0 else float("nan")
+    note = "first sample excluded: JIT warm-up" if len(all_timings) > 1 else "single sample: includes JIT warm-up"
     print(f"  avg prefill: {avg_prefill_ms:.1f}ms   avg load(SVD+quantize+pack): {avg_load_ms:.1f}ms")
     print(f"  decode: {total_decode_s:.3f}s / {total_steps} steps = {overall_ms_per_tok:.2f} ms/token "
-          f"({1000/overall_ms_per_tok:.2f} tok/s)")
+          f"({1000/overall_ms_per_tok:.2f} tok/s)  [{note}]")
 
     avg_after_prefill = sum(m[0] for m in all_mem) / len(all_mem)
     avg_ready = sum(m[1] for m in all_mem) / len(all_mem)
