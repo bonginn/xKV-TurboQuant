@@ -297,8 +297,13 @@ def _decode_softmax_reducev_fwd(attn_logits, attn_lse, q, o, v_A_buffer, num_kv_
 
 def _decode_grouped_att_m_fwd_rope(q, k_A_buffer, k_B_buffer, v_A_buffer,
                                    att_out, att_lse, num_kv_splits, max_kv_splits,
-                                   sm_scale, theta):
-    BLOCK_N = 32
+                                   sm_scale, theta, block_n=32, num_warps=4, num_stages=2):
+    # block_n (tokens per KV tile), num_warps and num_stages default to the
+    # validated launch configuration (32 / 4 / 2), so existing callers
+    # (decode_attention_fwd, decode_attention_fwd_with_lse) are unaffected
+    # unless they pass different values. They are parameters so the launch
+    # configuration can be tuned without editing the kernel.
+    BLOCK_N = block_n
     BLOCK_R = 64
     BLOCK_H = 16
 
@@ -337,8 +342,8 @@ def _decode_grouped_att_m_fwd_rope(q, k_A_buffer, k_B_buffer, v_A_buffer,
         Lk=Dk,
         Lv=Dv,
         THETA=theta,
-        num_warps=4,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
 
@@ -394,3 +399,169 @@ def decode_attention_fwd(
     ).reshape(batch, num_q_heads, head_dim)
 
     return o
+
+
+# ── LSE-exposing variant ────────────────────────────────────────────────────
+#
+# For the "compressed prefix + dense decode tail" design (XKVWiredCache in
+# scripts/xkv_wired_cache.py): combining the compressed-prefix branch's
+# attention output with a separately computed dense-tail branch's output
+# requires each branch's absolute log-sum-exp of its raw (scaled) attention
+# scores, not just the final normalized output. Stage 2
+# (_fwd_kernel_stage2 above) already computes exactly this value internally
+# as `global_lse` while combining kv_splits -- it is simply never written
+# out. This variant is a near-identical copy of _fwd_kernel_stage2 with ONE
+# added output (the merged LSE) and one extra tl.store; Stage 1
+# (_fwd_grouped_kernel_stage1_rope) is reused unchanged, since it already
+# writes per-split LSE into Att_Lse. decode_attention_fwd (above) is
+# unchanged.
+
+
+@triton.jit
+def _fwd_kernel_stage2_with_lse(
+    attn_logits,
+    attn_lse,
+    o,
+    lse_out,        # NEW: [batch, head_num] fp32 -- the merged (global) LSE
+    num_kv_splits,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_obs,
+    stride_oh,
+    stride_lse_ob,  # NEW
+    stride_lse_oh,  # NEW
+    kv_seq_len:    tl.constexpr,
+    MAX_KV_SPLITS: tl.constexpr,
+    MIN_BLOCK_KV:  tl.constexpr,
+    BLOCK_DV:      tl.constexpr,
+    Lv:            tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head  = tl.program_id(1)
+
+    cur_kv_seq_len = kv_seq_len
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    offs_d = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lv
+
+    global_exp_sum = 0.0
+    global_lse     = -float("inf")
+    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+
+    offs_v     = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
+    offs_logic = (cur_batch * stride_mid_ob + cur_head * stride_mid_oh) // Lv
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_kv_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
+
+    for split_kv_id in range(0, MAX_KV_SPLITS):
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end   = tl.minimum(split_kv_start + kv_len_per_split, cur_kv_seq_len)
+
+        if split_kv_end > split_kv_start:
+            tv = tl.load(attn_logits + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0)
+            in_coming_lse = tl.load(attn_lse + offs_logic + split_kv_id * stride_mid_os // Lv)
+            new_global_lse = tl.maximum(in_coming_lse, global_lse)
+            old_scale = tl.exp(global_lse - new_global_lse)
+            acc *= old_scale
+            exp_logic = tl.exp(in_coming_lse - new_global_lse)
+            acc += exp_logic * tv
+            global_exp_sum = global_exp_sum * old_scale + exp_logic
+            global_lse = new_global_lse
+
+    tl.store(
+        o + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+        acc / global_exp_sum,
+        mask=mask_d,
+    )
+    # NEW: also write out the merged absolute log-sum-exp (max + log(sum)),
+    # i.e. log(sum_i exp(raw_score_i)) over ALL kv positions in this branch --
+    # needed by the caller to merge this branch with another (e.g. a dense
+    # decode tail) via the standard two-branch LSE merge.
+    tl.store(
+        lse_out + cur_batch * stride_lse_ob + cur_head * stride_lse_oh,
+        global_lse + tl.log(global_exp_sum),
+    )
+
+
+def _decode_softmax_reducev_fwd_with_lse(attn_logits, attn_lse, q, o, lse_out, v_A_buffer,
+                                          num_kv_splits, max_kv_splits):
+    batch, head_num = q.shape[0], q.shape[1]
+    Lv         = v_A_buffer.shape[-1]
+    kv_seq_len = v_A_buffer.shape[1]
+    BLOCK_DV   = triton.next_power_of_2(Lv)
+
+    _fwd_kernel_stage2_with_lse[(batch, head_num)](
+        attn_logits, attn_lse, o, lse_out, num_kv_splits,
+        attn_logits.stride(0), attn_logits.stride(1), attn_logits.stride(2),
+        o.stride(0), o.stride(1),
+        lse_out.stride(0), lse_out.stride(1),
+        kv_seq_len=kv_seq_len,
+        MAX_KV_SPLITS=max_kv_splits,
+        MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        BLOCK_DV=BLOCK_DV,
+        Lv=Lv,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
+def decode_attention_fwd_with_lse(
+    q,              # [batch, num_q_heads, head_dim]
+    k_A_buffer,    # [batch, kv_len,       rank_k]
+    k_B_buffer,    # [batch, num_kv_heads,  rank_k, head_dim]
+    v_A_buffer,    # [batch, kv_len,        rank_v]
+    v_B_buffer,    # [batch, num_kv_heads,  rank_v, head_dim]
+    num_kv_splits, # [batch]
+    max_kv_splits, # int
+    sm_scale=1.0,
+    theta=10_000_000.0,
+    block_n=32,
+    num_warps=4,
+    num_stages=2,
+):
+    """Identical to decode_attention_fwd, except it ALSO returns each
+    (batch, q_head)'s absolute log-sum-exp of the raw (scaled) attention
+    scores over this branch's full kv_len, needed to correctly merge this
+    branch's output with another branch (e.g. a dense decode tail) computed
+    separately. Returns (o, lse) where o has the same shape/semantics as
+    decode_attention_fwd's return, and lse has shape [batch, num_q_heads].
+    """
+    assert v_A_buffer.shape[1] == k_A_buffer.shape[1]
+    assert v_B_buffer.shape[1] == k_B_buffer.shape[1]
+
+    num_kv_heads = v_B_buffer.shape[1]
+    kv_group_num = q.shape[1] // num_kv_heads
+    assert kv_group_num >= 1
+
+    batch, num_q_heads, head_dim = q.shape
+    rank_v = v_A_buffer.shape[-1]
+
+    attn_logits = torch.empty(
+        (batch, num_q_heads, max_kv_splits, rank_v), dtype=torch.float32, device=q.device,
+    )
+    attn_lse = torch.empty(
+        (batch, num_q_heads, max_kv_splits), dtype=torch.float32, device=q.device,
+    )
+
+    _decode_grouped_att_m_fwd_rope(
+        q, k_A_buffer, k_B_buffer, v_A_buffer,
+        attn_logits, attn_lse,
+        num_kv_splits, max_kv_splits,
+        sm_scale, theta, block_n=block_n, num_warps=num_warps, num_stages=num_stages,
+    )
+
+    o = torch.empty(batch, num_q_heads, rank_v, device=q.device, dtype=q.dtype)
+    lse_out = torch.empty(batch, num_q_heads, dtype=torch.float32, device=q.device)
+    _decode_softmax_reducev_fwd_with_lse(attn_logits, attn_lse, q, o, lse_out, v_A_buffer,
+                                          num_kv_splits, max_kv_splits)
+
+    # Stage 3: o @ v_B  →  [batch, num_q_heads, head_dim]
+    o = torch.matmul(
+        o.reshape(batch, num_kv_heads, -1, rank_v),
+        v_B_buffer,
+    ).reshape(batch, num_q_heads, head_dim)
+
+    return o, lse_out
