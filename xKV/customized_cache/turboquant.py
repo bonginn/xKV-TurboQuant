@@ -2,8 +2,14 @@
 
 This module implements the accuracy-first codec described in Algorithm 1 of
 "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate"
-(arXiv:2504.19874v1).  It intentionally does not implement bit packing or a
-fused inference kernel.
+(arXiv:2504.19874v1).  It does not implement a fused inference kernel.
+
+Physical 4-bit nibble packing (pack_turboquant_codes / unpack_turboquant_codes /
+PackedTurboQuantCodes, below) stores two 4-bit codes per byte.
+`TurboQuantCodes.indices` (produced by `encode()`) remains logical (one uint8
+byte per code) throughout the rest of this module; callers that want the
+physically packed form call `pack_turboquant_codes()` explicitly.
+`PackedXKVCache` (scripts/factorized_xkv_cache.py) stores this packed form.
 
 The Lloyd-Max codebooks are generated offline for the exact finite-dimensional
 sphere-coordinate distribution and loaded from a checked-in JSON asset at
@@ -134,6 +140,150 @@ class TurboQuantFactorPair:
     left_factor: torch.Tensor
     right_factor: torch.Tensor
     codes: TurboQuantCodes
+
+
+# ── Physical 4-bit nibble packing ─────────────────────────────────────────
+#
+# `TurboQuantCodes.indices` stores one LOGICAL code per uint8 byte, which is
+# not evidence of a physically packed cache (its own docstring says so). The
+# functions below convert that logical representation to and from a REAL
+# packed form where two 4-bit codes share one byte.
+
+@dataclass
+class PackedTurboQuantCodes:
+    """Physically packed TurboQuant codes: two 4-bit codes per byte.
+
+    ``packed`` has last dimension ``dimension // 2`` (half of the logical
+    ``TurboQuantCodes.indices``' last dimension) and dtype uint8. For
+    coordinate pair (2*i, 2*i+1), coordinate 2*i (even) is packed into the
+    LOW nibble and coordinate 2*i+1 (odd) into the HIGH nibble of
+    ``packed[..., i]``.
+
+    ``norms`` is stored as FP32, independent of ``left_factor``'s dtype.
+    """
+
+    packed: torch.Tensor
+    norms: torch.Tensor
+    dimension: int
+    bits: int
+    source_dtype: torch.dtype
+    codebook_checksum: str
+    rotation_checksum: str
+
+    @property
+    def storage_bytes(self) -> int:
+        """Actual physical bytes for packed codes + norms -- measured from
+        real tensor storage, never derived from a logical-bit-count formula."""
+        return (
+            self.packed.numel() * self.packed.element_size()
+            + self.norms.numel() * self.norms.element_size()
+        )
+
+
+def pack_turboquant_codes(codes: TurboQuantCodes) -> PackedTurboQuantCodes:
+    """Pack ``codes.indices`` (one logical 4-bit value per uint8 byte) into
+    real nibbles (two values per byte). Only supports bits=4 -- nibble
+    packing is specifically a 2-codes-per-byte scheme; other bit widths are
+    out of scope for the current K4/V4 product spec and would need a
+    different packing layout.
+
+    Fails closed (raises) rather than silently padding or truncating when
+    bits != 4, the dimension is odd (no implicit padding), indices fall
+    outside [0, 15], or the indices dtype is not uint8.
+    """
+    if codes.bits != 4:
+        raise ValueError(
+            f"pack_turboquant_codes only supports bits=4 (nibble packing), got bits={codes.bits}"
+        )
+    if codes.dimension % 2 != 0:
+        raise ValueError(
+            f"pack_turboquant_codes requires an even dimension (fail-closed, no implicit "
+            f"padding), got dimension={codes.dimension}"
+        )
+    indices = codes.indices
+    if indices.dtype != torch.uint8:
+        raise TypeError(f"codes.indices must be uint8, got {indices.dtype}")
+    if indices.shape[-1] != codes.dimension:
+        raise ValueError(
+            f"codes.indices last dimension ({indices.shape[-1]}) does not match "
+            f"codes.dimension ({codes.dimension})"
+        )
+    if indices.numel() > 0:
+        min_idx = int(indices.min().item())
+        max_idx = int(indices.max().item())
+        if min_idx < 0 or max_idx > 15:
+            raise ValueError(
+                f"index out of range for 4-bit packing: [{min_idx}, {max_idx}], "
+                f"must be in [0, 15]"
+            )
+
+    indices = indices.contiguous()
+    even = indices[..., 0::2]
+    odd = indices[..., 1::2]
+    packed = (even | (odd << 4)).to(torch.uint8).contiguous()
+
+    return PackedTurboQuantCodes(
+        packed=packed,
+        norms=codes.norms.to(torch.float32),
+        dimension=codes.dimension,
+        bits=codes.bits,
+        source_dtype=codes.source_dtype,
+        codebook_checksum=codes.codebook_checksum,
+        rotation_checksum=codes.rotation_checksum,
+    )
+
+
+def unpack_turboquant_codes(packed_codes: PackedTurboQuantCodes) -> TurboQuantCodes:
+    """Inverse of ``pack_turboquant_codes`` -- reconstructs the logical
+    uint8-per-code ``TurboQuantCodes.indices`` tensor from packed nibbles,
+    bit-exactly (no precision loss: this is a pure bit-layout transform)."""
+    packed = packed_codes.packed
+    if packed.dtype != torch.uint8:
+        raise TypeError(f"packed_codes.packed must be uint8, got {packed.dtype}")
+    expected_packed_dim = packed_codes.dimension // 2
+    if packed.shape[-1] != expected_packed_dim:
+        raise ValueError(
+            f"packed_codes.packed last dimension ({packed.shape[-1]}) does not match "
+            f"dimension//2 ({expected_packed_dim})"
+        )
+
+    packed = packed.contiguous()
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+
+    out_shape = packed.shape[:-1] + (packed_codes.dimension,)
+    indices = torch.empty(out_shape, dtype=torch.uint8, device=packed.device)
+    indices[..., 0::2] = low
+    indices[..., 1::2] = high
+
+    return TurboQuantCodes(
+        indices=indices,
+        norms=packed_codes.norms,
+        dimension=packed_codes.dimension,
+        bits=packed_codes.bits,
+        source_dtype=packed_codes.source_dtype,
+        codebook_checksum=packed_codes.codebook_checksum,
+        rotation_checksum=packed_codes.rotation_checksum,
+    )
+
+
+def validate_packed_codes(packed_codes: PackedTurboQuantCodes, quantizer: "TurboQuantMSE") -> None:
+    """Checks ``packed_codes`` was produced by (or is compatible with)
+    ``quantizer`` -- same dimension, bits, codebook, and rotation. Raises
+    ValueError on any mismatch. This is the dedicated K-vs-V check: K and V
+    codecs have different ``dimension`` (384 vs 576) and are constructed
+    from different codebook assets, so calling this with the wrong
+    quantizer for a given packed_codes object fails here, not silently
+    later at reconstruction time."""
+    if packed_codes.dimension != quantizer.dimension or packed_codes.bits != quantizer.bits:
+        raise ValueError(
+            f"packed_codes metadata (dimension={packed_codes.dimension}, bits={packed_codes.bits}) "
+            f"does not match quantizer (dimension={quantizer.dimension}, bits={quantizer.bits})"
+        )
+    if packed_codes.codebook_checksum != quantizer.codebook_checksum:
+        raise ValueError("packed_codes were produced with a different codebook")
+    if packed_codes.rotation_checksum != quantizer.rotation_checksum:
+        raise ValueError("packed_codes were produced with a different rotation")
 
 
 def build_haar_rotation(
