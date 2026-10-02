@@ -1,3 +1,5 @@
+> **This fork adds 4-bit TurboQuant quantization of the xKV factors, a packed cache and a fused Triton dequantization kernel. See [README_TURBOQUANT.md](README_TURBOQUANT.md).**
+
 <div align="center">
 <h1>
   <img 
