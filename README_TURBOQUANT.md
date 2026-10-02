@@ -6,9 +6,9 @@ Qwen2.5-14B-Instruct-1M, 32K context, batch size 1, one RTX 6000 Ada:
 
 - The KV cache is **13.4× smaller** than the dense BF16 cache (5.96 → 0.44 GiB).
 - Quantizing the factors to 4 bits costs **0.04 pp** of RULER accuracy (10-task macro, 0.9232 → 0.9228).
-- The fused kernel dequantizes **about 10× faster** than the PyTorch reference and is bit-identical to it.
+- The fused kernel dequantizes **about 10× faster** than the PyTorch reference and is bit-identical to it. Together with a per-group dequantization cache it takes packed decode from 135 to 66 ms/token, the same speed as keeping the factors in BF16.
 
-Caveats, detailed in [Scope and limitations](#scope-and-limitations): at batch size 1 the model weights dominate GPU memory, so total memory drops by 16%, and decode is about 1.3× slower than dense.
+Caveats, detailed in [Scope and limitations](#scope-and-limitations): at batch size 1 the model weights dominate GPU memory, so total memory drops by 16%, and decode is about 1.17× slower than dense (66 vs 56.5 ms/token).
 
 ## How it works
 
@@ -27,7 +27,7 @@ Caveats, detailed in [Scope and limitations](#scope-and-limitations): at batch s
 | `scripts/xkv_wired_cache.py` | `XKVWiredCache`: dense decode tail for a compressed prefix kept by the caller |
 | `efficiency/ops/fused_attention/rope/v1_dequant_fused.py` | Triton kernel: 4-bit unpack, codebook lookup and norm in one launch |
 | `efficiency/ops/fused_attention/rope/v1.py` | Decode attention that also returns the log-sum-exp |
-| `scripts/eval_ruler_*.py`, `measure_memory_timeline.py`, `bench_dequant_fused.py` | The experiments below |
+| `scripts/eval_ruler_*.py`, `measure_memory_timeline.py`, `bench_*.py` | The experiments below |
 
 ## Results
 
@@ -46,15 +46,27 @@ The packed cache grows by about 0.06 GiB once decoding starts, because one layer
 
 ### Total GPU memory and decode speed
 
-`scripts/eval_ruler_factorized_cache.py`, `niah_multivalue`, 5 samples of about 32K tokens, averages:
+`scripts/eval_ruler_factorized_cache.py`, `niah_multivalue`, 6 samples of about 32K tokens. The first sample is left out of the decode speed because it includes one-time Triton JIT warm-up (119.6 ms/token for packed, against 66 for the next five):
 
 | | Dense (FlashAttention-2) | xKV, BF16 factors | xKV + TurboQuant, packed |
 |---|---:|---:|---:|
-| Total GPU memory, ready to decode | 33.38 GiB | 28.40 GiB (−14.9%) | 27.95 GiB (−16.3%) |
-| Decode, ms/token | 56.0 | 70.5 (1.26×) | 72.4 (1.29×) |
-| Score | 1.00 | 1.00 | 1.00 |
+| Total GPU memory, ready to decode | 33.38 GiB | 28.41 GiB (−14.9%) | 27.96 GiB (−16.3%) |
+| Decode, ms/token | 56.5 | 66.0 (1.17×) | 66.1 (1.17×) |
+| Score (6 samples) | 1.00 | 0.96 | 0.96 |
 
-An earlier run of the same script measured 65.6 and 76.3 ms/token for BF16 factors and packed (dense unchanged at 56.0), so treat the gap between the two xKV variants as noise. For context, before the per-group dequantization cache and the fused kernel, packed decode measured about 135 ms/token in the same setup (earlier development run; those versions are not in this repository).
+Packing the factors to 4 bits costs no decode speed compared with keeping them in BF16. Both xKV variants miss one of the four needles in the sixth sample (0.75) that dense answers correctly; the BF16 factors miss it too, so it is not caused by the quantization. SVD, quantization and packing add about 1.2 s once per request, on top of a prefill of about 15.7 s.
+
+### Decode optimizations
+
+`scripts/bench_packed_decode_ablation.py` runs the same decode on the same compressed cache with each optimization switched on in turn, in one process and in rotating order. The generated tokens are identical. 5 samples, median ms/token with the range:
+
+| `PackedXKVCache` dequantization | ms/token | Saved |
+|---|---:|---:|
+| PyTorch, on every layer call (original) | 134.7 (132.6–135.2) | |
+| PyTorch, once per layer group (single-entry cache) | 82.3 (81.2–82.6) | 52.4 ms (39%) |
+| Fused Triton kernel, once per layer group (shipped) | 66.1 (65.3–74.7) | 16.2 ms (20%) |
+
+One of the five fused samples ran slower (74.7); the other four are within 65.3–66.3.
 
 ### Fused dequantization kernel
 
@@ -112,13 +124,19 @@ Kernel (no model, needs a CUDA GPU):
 python scripts/bench_dequant_fused.py
 ```
 
-Decode speed and GPU memory of the three variants:
+Decode speed and GPU memory of the three variants (use at least 2 samples: the first is warm-up and is left out of the speed):
 
 ```bash
 M=Qwen/Qwen2.5-14B-Instruct-1M
-python scripts/eval_ruler_factorized_cache.py --model $M --task niah_multivalue --num-samples 5 --dense
-python scripts/eval_ruler_factorized_cache.py --model $M --task niah_multivalue --num-samples 5
-python scripts/eval_ruler_factorized_cache.py --model $M --task niah_multivalue --num-samples 5 --packed
+python scripts/eval_ruler_factorized_cache.py --model $M --task niah_multivalue --num-samples 6 --dense
+python scripts/eval_ruler_factorized_cache.py --model $M --task niah_multivalue --num-samples 6
+python scripts/eval_ruler_factorized_cache.py --model $M --task niah_multivalue --num-samples 6 --packed
+```
+
+Effect of each decode optimization:
+
+```bash
+python scripts/bench_packed_decode_ablation.py --model Qwen/Qwen2.5-14B-Instruct-1M --num-samples 5
 ```
 
 KV-cache memory ratio (each mode in its own process):
@@ -177,7 +195,7 @@ pytest tests/test_turboquant_packing.py tests/test_turboquant_mse.py tests/test_
 ## Scope and limitations
 
 - **The 13.4× is for the KV cache only.** At batch size 1 the 27.5 GiB of weights dominate, so total GPU memory drops by 16%, not 13×.
-- **Decode is slower than dense**: 72–76 ms/token against 56 ms/token at batch size 1.
+- **Decode is slower than dense**: 66 ms/token against 56.5 ms/token (1.17×) at batch size 1.
 - **Batch size 1, greedy decoding, 4-bit only.** Anything else, and exceeding the 512-token dense tail, raises an error instead of continuing silently.
 - **Only the left factors `A` are quantized**; the right factors `B` stay BF16.
 - **Accuracy**: 20 samples per task, so one sample is 5 pp on a task, and the 0.04 pp difference is far below the noise. The figure measures only the cost of quantizing the factors. xKV's own compression costs accuracy against full attention: an earlier run of the same 10 tasks with 32 samples each scored 0.9469 for full attention and 0.9099 for xKV (not reproduced by these scripts).
